@@ -1,3 +1,5 @@
+from datetime import datetime, timedelta
+import json
 import os
 import subprocess
 import time
@@ -14,21 +16,135 @@ OUTPUT_HTML = os.path.join(REPO_DIR, "index.html")
 
 MAX_CHECKINS = 100
 
-# Message Board Configuration
+# DM Message Board Configuration
 LOG_FILE = "/home/malachi/mesh_room_log.txt"
 MAX_HISTORY_TO_SEND = 5
+
+# Net Roster Persistence Configuration
+ACTIVE_ROSTER_FILE = "/home/malachi/mwm_current_week.json"
+ARCHIVE_DIR = "/home/malachi/mwm_archives"
 
 # Git auto-publish settings
 AUTO_PUSH_TO_GITHUB = True
 PUSH_INTERVAL = 60  # Minimum seconds between git pushes
 
 net_checkins = []
+current_net_id = ""
 last_push_time = 0
 NET_TAG = "#mwm"
 
 
+def get_current_net_id():
+    """Generates a unique identifier anchored to the Wednesday net cycle.
+    A net week runs from Wednesday through the following Tuesday.
+    """
+    now = datetime.now()
+    wd = now.weekday()  # Mon=0, Tue=1, Wed=2, Thu=3, Fri=4, Sat=5, Sun=6
+
+    # Calculate days elapsed since the most recent Wednesday (weekday 2)
+    days_elapsed = (wd - 2) % 7
+
+    # Find the date of that Wednesday
+    wednesday_date = now - timedelta(days=days_elapsed)
+    return wednesday_date.strftime("%Y-%m-%d")
+
+
+def ensure_weekly_rotation():
+    """Checks if a new Wednesday net period has started. Resets the active roster."""
+    global net_checkins, current_net_id
+
+    now_id = get_current_net_id()
+
+    # If the net ID changed, archive old roster and start fresh
+    if current_net_id and current_net_id != now_id:
+        print(
+            f"[{time.strftime('%H:%M:%S')}] New Wednesday net period detected"
+            f" ({now_id}). Archiving previous net..."
+        )
+        archive_previous_net()
+        net_checkins = []
+        current_net_id = now_id
+        save_active_roster()
+        write_html_report()
+        maybe_git_push()
+
+
+def archive_previous_net():
+    """Archives the active roster into a permanent weekly JSON file."""
+    if not net_checkins:
+        return
+
+    os.makedirs(ARCHIVE_DIR, exist_ok=True)
+    archive_file = os.path.join(
+        ARCHIVE_DIR, f"mwm_archive_{current_net_id}.json"
+    )
+
+    try:
+        with open(archive_file, "w", encoding="utf-8") as f:
+            json.dump(
+                {
+                    "net_id": current_net_id,
+                    "checkins": net_checkins,
+                },
+                f,
+                indent=2,
+            )
+        print(f"Archived previous net to {archive_file}")
+    except Exception as e:
+        print(f"Error archiving previous net: {e}")
+
+
+def load_active_roster():
+    """Loads current week's check-ins from disk on startup."""
+    global current_net_id
+    current_net_id = get_current_net_id()
+
+    if os.path.exists(ACTIVE_ROSTER_FILE):
+        try:
+            with open(ACTIVE_ROSTER_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                # Ensure the saved data belongs to the current net cycle
+                if data.get("net_id") == current_net_id:
+                    print(
+                        f"Loaded {len(data.get('checkins', []))} check-ins for"
+                        f" net {current_net_id}"
+                    )
+                    return data.get("checkins", [])
+                else:
+                    print(
+                        "Found saved roster from a previous net cycle."
+                        " Archiving and starting fresh."
+                    )
+                    archive_file = os.path.join(
+                        ARCHIVE_DIR,
+                        f"mwm_archive_{data.get('net_id', 'old')}.json",
+                    )
+                    os.makedirs(ARCHIVE_DIR, exist_ok=True)
+                    with open(archive_file, "w", encoding="utf-8") as af:
+                        json.dump(data, af, indent=2)
+        except Exception as e:
+            print(f"Error loading roster state: {e}")
+
+    return []
+
+
+def save_active_roster():
+    """Saves active net's roster to disk."""
+    try:
+        data = {
+            "net_id": current_net_id,
+            "checkins": net_checkins,
+        }
+        with open(ACTIVE_ROSTER_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+    except Exception as e:
+        print(f"Error saving roster state: {e}")
+
+
 def process_checkin(sender_id, short_name, text):
     global net_checkins
+    ensure_weekly_rotation()
+
     timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
 
     net_checkins.insert(
@@ -44,6 +160,7 @@ def process_checkin(sender_id, short_name, text):
     if len(net_checkins) > MAX_CHECKINS:
         net_checkins.pop()
 
+    save_active_roster()
     write_html_report()
     maybe_git_push()
 
@@ -56,7 +173,6 @@ def maybe_git_push():
     current_time = time.time()
     if current_time - last_push_time > PUSH_INTERVAL:
         try:
-            # Run git commands scoped directly to your local Mesh_Wed repo folder
             subprocess.run(
                 ["git", "add", "index.html"],
                 cwd=REPO_DIR,
@@ -79,9 +195,14 @@ def maybe_git_push():
                 stderr=subprocess.DEVNULL,
             )
             last_push_time = current_time
-            print(f"[{time.strftime('%H:%M:%S')}] Roster successfully pushed to https://queencitynerd.github.io/Mesh_Wed/")
+            print(
+                f"[{time.strftime('%H:%M:%S')}] Roster successfully pushed to"
+                " https://queencitynerd.github.io/Mesh_Wed/"
+            )
         except subprocess.CalledProcessError as e:
-            print(f"[{time.strftime('%H:%M:%S')}] Git push skipped/failed (Check local git status): {e}")
+            print(
+                f"[{time.strftime('%H:%M:%S')}] Git push skipped/failed: {e}"
+            )
 
 
 def write_html_report():
@@ -227,7 +348,7 @@ def write_html_report():
     <div class="container">
         <header>
             <h1>STMesh #mwm Net Monitor</h1>
-            <div class="subtitle">STMesh Weekly 24-Hour Net &bull; LongFast Channel</div>
+            <div class="subtitle">STMesh Weekly Net Cycle &bull; LongFast Channel &bull; Net Date: {current_net_id}</div>
         </header>
 
         <div class="info-card">
@@ -247,7 +368,7 @@ def write_html_report():
                     </tr>
                 </thead>
                 <tbody>
-                    {''.join(roster_rows) if roster_rows else '<tr><td colspan="3" style="text-align: center; color: #8b949e;">No #mwm check-ins recorded yet for STMesh today.</td></tr>'}
+                    {''.join(roster_rows) if roster_rows else '<tr><td colspan="3" style="text-align: center; color: #8b949e;">No #mwm check-ins recorded yet for this weekly net cycle.</td></tr>'}
                 </tbody>
             </table>
         </div>
@@ -267,7 +388,7 @@ def write_html_report():
 
 
 def send_recent_log(interface, destination_id):
-    """Reads the log and sends up to the last 5 entries as individual packets."""
+    """Reads the DM log and sends up to the last 5 entries as individual packets."""
     if not os.path.exists(LOG_FILE):
         interface.sendText(
             "Board is currently empty.", destinationId=destination_id, wantAck=False
@@ -316,7 +437,7 @@ def on_receive(packet, interface):
             sender_id = packet.get("fromId", "unknown")
             my_node_id = getattr(interface.myInfo, "my_node_num", None)
 
-            # 1. Handle Direct Messages (DM Message Board)
+            # 1. Handle Direct Messages (DM Message Board - persists indefinitely)
             if packet.get("to") == my_node_id:
                 print(f"Received DM from {sender_id}: {text}")
 
@@ -345,8 +466,7 @@ def on_receive(packet, interface):
                     )
 
                 print(
-                    f"Captured #mwm check-in from [{short_name}]"
-                    f" ({sender_id})"
+                    f"Captured #mwm check-in from [{short_name}] ({sender_id})"
                 )
                 process_checkin(sender_id, short_name, text)
 
@@ -355,19 +475,28 @@ def on_receive(packet, interface):
 
 
 def main():
+    global net_checkins
     print(f"Connecting to STMesh node on {SERIAL_PORT}...")
     interface = meshtastic.serial_interface.SerialInterface(devPath=SERIAL_PORT)
+
+    # Load active weekly net roster state from disk
+    net_checkins = load_active_roster()
+
+    # Render starting HTML page immediately on launch
+    write_html_report()
+    maybe_git_push()
 
     pub.subscribe(on_receive, "meshtastic.receive")
 
     print(
-        "STMesh Combined #mwm Monitor & Room Server running. Output target:"
-        f" {OUTPUT_HTML}"
+        f"STMesh Combined #mwm Monitor & Room Server running [Net Date:"
+        f" {current_net_id}]. Output target: {OUTPUT_HTML}"
     )
 
     try:
         while True:
-            time.sleep(1)
+            time.sleep(10)
+            ensure_weekly_rotation()
     except KeyboardInterrupt:
         print("Shutting down...")
     finally:
